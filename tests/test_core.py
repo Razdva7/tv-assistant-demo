@@ -175,3 +175,24 @@ def test_asr_transcribe_with_fake_model():
     asr.model = type("M", (), {"transcribe": lambda self, path: R()})()
     out = asr.transcribe(_wav(2))
     assert out["text"] == "65 дюймов для PS5" and out["seconds"] == 2.0
+
+
+# ---------- Категории и частые запросы ----------
+from core.categories import CATEGORIES  # noqa: E402
+from core.rules import cond_labels  # noqa: E402
+
+
+def test_only_tv_ready_and_all_have_preview():
+    assert [c.id for c in CATEGORIES.values() if c.ready] == ["tv"]
+    for c in CATEGORIES.values():
+        assert len(c.questions) >= 3 and c.voice_example and len(c.compare) >= 4
+
+
+@pytest.mark.parametrize("label", list(CATEGORIES["tv"].presets))
+def test_tv_presets_give_known_conditions_and_picks(label):
+    cond = dict(CATEGORIES["tv"].presets[label])
+    known = {"use", "room", "diag_min", "diag_max", "price_max", "panel", "resolution", "min_refresh", "smart_os"}
+    assert set(cond) <= known
+    assert cond_labels(cond)  # у каждого условия есть подпись-чип
+    res = recommend(CAT, cond, "stock_store1")
+    assert res.picks or res.nearest  # частый запрос не должен давать пустой экран

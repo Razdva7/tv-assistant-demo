@@ -1,5 +1,5 @@
 # torch в Colab уже установлен; для запуска на своём компьютере см. README
-streamlit>=1.67
+streamlit==1.67.0  # оформление кнопки микрофона проверено на этой версии
 pandas>=2.0
 transformers>=4.45
 huggingface_hub
