@@ -1,0 +1,8 @@
+# torch в Colab уже установлен; для запуска на своём компьютере см. README
+streamlit>=1.67
+pandas>=2.0
+transformers>=4.45
+huggingface_hub
+sentencepiece
+# Распознавание речи GigaAM-v3 ставится отдельно (см. README и colab_launch.ipynb):
+# pip install "git+https://github.com/salute-developers/GigaAM.git"
