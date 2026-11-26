@@ -75,3 +75,24 @@ def summary(cond: dict, noun: str = "телевизор") -> str:
     """Фраза для резюме потребности вслух: «Правильно понимаю: нужен телевизор …?»"""
     need = need_phrase(cond, noun)
     return f"Правильно понимаю: нужен {need}?" if need else ""
+
+
+_QUESTION_START = ("зачем", "почему", "нужен ли", "нужна ли", "нужно ли", "какой", "какая", "какую", "может",
+                   "стоит ли", "а если", "а не", "чем")
+
+
+def match_objection(category: str, text: str) -> dict | None:
+    """Возражение клиента по ключевым словам из таблицы экспертов (колонка keywords, через «;»)."""
+    t = " " + (text or "").lower().replace("ё", "е") + " "
+    for o in objections(category):
+        for kw in (o.get("keywords") or "").split(";"):
+            kw = kw.strip().lower().replace("ё", "е")
+            if kw and kw in t:
+                return o
+    return None
+
+
+def is_question(text: str) -> bool:
+    """Фраза — вопрос клиента, а не требование к товару («OLED выгорает?», «зачем 120 Гц»)."""
+    t = (text or "").strip().lower()
+    return t.endswith("?") or t.startswith(_QUESTION_START)

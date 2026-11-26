@@ -302,3 +302,64 @@ def test_report_counts_unmet_demand():
     assert rep["wrong_reasons"] == [("не та цена", 1)]
     assert rep["terms_avg"] == 4.0
     assert summarize(log.iloc[0:0])["total"] == 0
+
+
+# ---------- Диалог: одно окно «что делать сейчас» ----------
+from core import knowledge
+from core.dialog import build_reply, merge_cond, summary_text
+
+
+def test_reply_one_window_is_short():
+    r = build_reply(CAT, {"diag_min": 55, "diag_max": 65, "panel_not": "OLED"}, STORE)
+    assert r.understood.startswith("телевизор — ") and "не OLED" in r.understood
+    assert r.action.startswith("Покажите **") and "₽" in r.action
+    assert len(r.reasons) <= 3 and len(r.alts) <= 2 and len(r.asks) <= 2
+    assert all("OLED" != p.row.panel for p in r.picks)
+    assert r.asks == ["budget", "use"]
+
+
+def test_reply_empty_and_no_match():
+    r = build_reply(CAT, {}, STORE)
+    assert "Спросите" in r.action and r.asks == ["distance", "budget"]
+    r = build_reply(CAT, {"diag_min": 65, "diag_max": 65, "panel": "OLED", "price_max": 90000}, STORE)
+    assert not r.exact and "мешает" in r.action
+    assert any(x.startswith("Компромисс") for x in r.reasons)
+
+
+def test_reply_skips_answered_questions_and_offers_addons_by_need():
+    r = build_reply(CAT, {"diag_min": 55, "diag_max": 55}, STORE, skip_asks={"budget"})
+    assert "budget" not in r.asks
+    r = build_reply(CAT, {"diag_min": 65, "diag_max": 65, "wall_mount": True}, STORE)
+    assert any("Кронштейн" in a["item"] for a in r.addons)
+    assert build_reply(CAT, {"diag_min": 43, "diag_max": 43}, STORE).addons == []
+
+
+def test_merge_cond_replaces_opposites():
+    assert merge_cond({"panel_not": "OLED"}, {"panel": "OLED"}) == {"panel": "OLED"}
+    assert merge_cond({"panel": "OLED"}, {"panel_not": "OLED"}) == {"panel_not": "OLED"}
+    assert merge_cond({"price_min": 80000}, {"price_max": 50000}) == {"price_max": 50000}
+    assert merge_cond({"use": "games"}, {"price_max": 1}) == {"use": "games", "price_max": 1}
+
+
+@pytest.mark.parametrize("text,question,expected", [
+    ("OLED выгорает?", True, "OLED выгорает?"),
+    ("а он не выгорит", False, "OLED выгорает?"),
+    ("дорого", False, "Почему этот дороже, если диагональ та же?"),
+    ("может подождать черную пятницу", True, "Может подождать скидок?"),
+    ("зачем 120 герц", True, "Зачем 120 Гц, если смотрю кино?"),
+])
+def test_objection_matching(text, question, expected):
+    o = knowledge.match_objection("tv", text)
+    assert o and o["question"] == expected
+    assert knowledge.is_question(text) == question
+
+
+def test_condition_phrases_are_not_objections():
+    for t in ["65 дюймов для PS5 до 100 тысяч", "только не олед, 55 или 65 дюймов", "повесят на стену"]:
+        assert knowledge.match_objection("tv", t) is None
+
+
+def test_summary_text_names_need_and_top_model():
+    cond = {"use": "games", "diag_min": 65, "diag_max": 65}
+    s = summary_text(cond, build_reply(CAT, cond, STORE))
+    assert s.startswith("Правильно понимаю: нужен телевизор — ") and "советую" in s and "₽" in s

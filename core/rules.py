@@ -33,7 +33,7 @@ OVER_BUDGET_TOLERANCE = 0.10  # +10% к бюджету допускается т
 
 
 def rub(x: float) -> str:
-    return f"{int(round(x)):,}".replace(",", " ") + " ₽"
+    return f"{int(round(x)):,}".replace(",", "\u00a0") + "\u00a0₽"  # неразрывные пробелы: цена не рвётся на строки
 
 
 def cond_labels(cond: dict) -> list[tuple[str, str]]:

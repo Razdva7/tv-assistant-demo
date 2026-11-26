@@ -31,6 +31,9 @@ def summarize(log: pd.DataFrame, top: int = 3) -> dict:
     if "terms_total" in log and log["terms_total"].max() > 0:
         res["terms_avg"] = round(float(log["terms_done"].mean()), 1)
         res["terms_total"] = int(log["terms_total"].max())
+    if "summary_confirmed" in log:
+        res["summary_share"] = round(float(log["summary_confirmed"].mean()) * 100)
+        res["turns_avg"] = round(float(log["seller_turns"].mean()), 1)
     unmet = log.loc[out == "no_match", "conditions"].map(_need)
     unmet = unmet[unmet != ""].value_counts().head(top)
     res["unmet"] = list(unmet.items())
