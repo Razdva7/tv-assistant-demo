@@ -1,39 +1,41 @@
-"""Сводка журнала итогов для руководителя магазина: сколько консультаций, чем закончились,
-чего не хватило в магазине (неудовлетворённый спрос). Без Streamlit — проверяется тестами."""
-from __future__ import annotations
+"""Настройки прототипа. Всё меняется переменными окружения, код трогать не нужно."""
+import os
+from pathlib import Path
 
-import json
-
-import pandas as pd
-
-from .rules import cond_labels
+ROOT = Path(__file__).resolve().parent.parent
+CATALOG_PATH = ROOT / "data" / "tv_catalog.csv"
+LOG_PATH = ROOT / "logs" / "events.csv"
 
 
-def _need(conditions: str) -> str:
+def _has_cuda() -> bool:
     try:
-        cond = json.loads(conditions)
-    except (TypeError, ValueError):
-        return ""
-    return ", ".join(label for _, label in cond_labels(cond))
+        import torch
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
 
 
-def summarize(log: pd.DataFrame, top: int = 3) -> dict:
-    total = len(log)
-    if not total:
-        return {"total": 0}
-    out = log["outcome"]
-    res = {
-        "total": total,
-        "shown_share": round((out == "shown").mean() * 100),
-        "no_match": int((out == "no_match").sum()),
-        "wrong": int((out == "wrong").sum()),
-    }
-    if "terms_total" in log and log["terms_total"].max() > 0:
-        res["terms_avg"] = round(float(log["terms_done"].mean()), 1)
-        res["terms_total"] = int(log["terms_total"].max())
-    unmet = log.loc[out == "no_match", "conditions"].map(_need)
-    unmet = unmet[unmet != ""].value_counts().head(top)
-    res["unmet"] = list(unmet.items())
-    reasons = log.loc[(out == "wrong") & log["reason"].notna(), "reason"].value_counts().head(top)
-    res["wrong_reasons"] = list(reasons.items())
-    return res
+HAS_CUDA = _has_cuda()
+
+# Разбор выжимки: "llm" — малая модель + проверка + правила; "rules" — только правила (без модели).
+PARSER = os.getenv("PARSER", "llm")
+
+# Модель для разбора. На видеокарте T4 — 1.5B, на процессоре — 0.5B.
+LLM_MODEL = os.getenv(
+    "LLM_MODEL",
+    "Qwen/Qwen2.5-1.5B-Instruct" if HAS_CUDA else "Qwen/Qwen2.5-0.5B-Instruct",
+)
+LLM_TIMEOUT_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "160"))
+
+# Распознавание речи: "gigaam" (GigaAM-v3, MIT), "whisper" (openai/whisper-small) или "none".
+ASR_BACKEND = os.getenv("ASR_BACKEND", "gigaam")
+GIGAAM_MODEL = os.getenv("GIGAAM_MODEL", "v3_e2e_rnnt")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "openai/whisper-small")
+MAX_AUDIO_SECONDS = 24  # короткий режим GigaAM работает до 25 секунд
+
+STORES = {
+    "stock_store1": "Магазин №1 · ТЦ «Северный»",
+    "stock_store2": "Магазин №2 · ТЦ «Центральный»",
+    "stock_store3": "Магазин №3 · ТЦ «Южный»",
+}

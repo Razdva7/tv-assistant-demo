@@ -1,73 +1,77 @@
-"""Реестр категорий. Новая категория = описание здесь + каталог + правила подбора.
-
-Готова только категория «Телевизоры». Для остальных хранится превью: какие вопросы
-задаст помощник, пример голосовой фразы и что будет в сравнении. Подбора для них нет,
-потому что нет каталога и проверенных правил — выдуманные товары не показываем.
-"""
+"""Распознавание речи продавца. Основной вариант — GigaAM-v3 (Сбер, лицензия MIT),
+запасной — Whisper-small. Звук пишется во временный файл и удаляется сразу после распознавания."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import io
+import os
+import tempfile
+import time
+import wave
 
-from .rules import QUESTIONS as TV_QUESTIONS
-
-
-@dataclass(frozen=True)
-class Category:
-    id: str
-    name: str
-    icon: str
-    ready: bool
-    questions: list[str]                  # вопросы покупателю (для превью и подсказки)
-    voice_example: str                    # пример выжимки голосом
-    compare: list[str]                    # что будет в сравнении
-    presets: dict[str, dict] = field(default_factory=dict)  # частые запросы -> условия подбора
+from .config import GIGAAM_MODEL, MAX_AUDIO_SECONDS, WHISPER_MODEL
 
 
-TV_PRESETS = {
-    "🎮 Для PS5 / Xbox": {"use": "games", "min_refresh": 120, "diag_min": 55, "diag_max": 65},
-    "🍳 На кухню, маленький": {"diag_min": 32, "diag_max": 43},
-    "🎬 Кино в тёмной комнате": {"use": "movies", "room": "dark"},
-    "💰 Недорогой, до 30 тыс.": {"price_max": 30000},
-    "👵 Родителям, простой": {"use": "tv", "diag_min": 43, "diag_max": 50, "price_max": 40000},
-}
+def _trim_wav(data: bytes, max_seconds: float) -> tuple[bytes, float]:
+    """Обрезает WAV до max_seconds. Возвращает (байты, длительность исходной записи)."""
+    with wave.open(io.BytesIO(data)) as w:
+        rate, n = w.getframerate(), w.getnframes()
+        duration = n / float(rate)
+        if duration <= max_seconds:
+            return data, duration
+        params = w.getparams()
+        frames = w.readframes(int(max_seconds * rate))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setparams(params)
+        out.writeframes(frames)
+    return buf.getvalue(), duration
 
-CATEGORIES: dict[str, Category] = {
-    "tv": Category(
-        id="tv", name="Телевизоры", icon="📺", ready=True,
-        questions=[q["label"] for q in TV_QUESTIONS.values()],
-        voice_example="«шестьдесят пять дюймов, для плейстейшн, до ста тысяч»",
-        compare=["Диагональ", "Матрица", "Разрешение", "Частота", "HDMI 2.1", "Яркость", "Платформа", "Цена"],
-        presets=TV_PRESETS,
-    ),
-    "fridge": Category(
-        id="fridge", name="Холодильники", icon="🧊", ready=False,
-        questions=["Сколько человек в семье", "Место под холодильник: ширина и высота",
-                   "Нужна ли No Frost", "Встроенный или отдельно стоящий", "Бюджет"],
-        voice_example="«семья из четырёх, ниша шестьдесят сантиметров, ноу фрост, до шестидесяти тысяч»",
-        compare=["Объём", "Габариты", "No Frost", "Класс энергии", "Уровень шума", "Цена"],
-    ),
-    "washer": Category(
-        id="washer", name="Стиральные машины", icon="🌀", ready=False,
-        questions=["Сколько стирают за раз", "Глубина места", "Нужна ли сушка", "Бюджет"],
-        voice_example="«узкая до сорока пяти сантиметров, на семь килограмм, с паром»",
-        compare=["Загрузка", "Глубина", "Отжим", "Сушка", "Уровень шума", "Цена"],
-    ),
-    "phone": Category(
-        id="phone", name="Смартфоны", icon="📱", ready=False,
-        questions=["Android или iPhone", "Что важнее: камера, батарея, игры", "Размер экрана", "Бюджет"],
-        voice_example="«андроид, хорошая камера и батарея, до тридцати тысяч»",
-        compare=["Экран", "Камера", "Аккумулятор", "Память", "Процессор", "Цена"],
-    ),
-    "laptop": Category(
-        id="laptop", name="Ноутбуки", icon="💻", ready=False,
-        questions=["Для чего: учёба, работа, игры", "Нужно ли носить с собой", "Размер экрана", "Бюджет"],
-        voice_example="«для учёбы, лёгкий, пятнадцать дюймов, до шестидесяти тысяч»",
-        compare=["Процессор", "Память", "Накопитель", "Экран", "Вес", "Цена"],
-    ),
-    "vacuum": Category(
-        id="vacuum", name="Пылесосы", icon="🧹", ready=False,
-        questions=["Площадь и покрытие пола", "Есть ли животные", "Робот, вертикальный или обычный", "Бюджет"],
-        voice_example="«робот, есть кошка, ламинат и ковры, до тридцати тысяч»",
-        compare=["Тип", "Мощность всасывания", "Время работы", "Влажная уборка", "Шум", "Цена"],
-    ),
-}
+
+class ASR:
+    def __init__(self, backend: str = "gigaam"):
+        self.kind = None
+        self.note = ""
+        if backend == "gigaam":
+            try:
+                import gigaam  # pip install git+https://github.com/salute-developers/GigaAM.git
+
+                self.model = gigaam.load_model(GIGAAM_MODEL)
+                self.kind = f"GigaAM-v3 ({GIGAAM_MODEL})"
+            except Exception as e:  # пакет не встал — пробуем ту же модель через Hugging Face
+                self.note = f"пакет gigaam недоступен ({e}); "
+                try:
+                    from transformers import AutoModel
+
+                    revision = GIGAAM_MODEL.replace("v3_", "")
+                    self.model = AutoModel.from_pretrained("ai-sage/GigaAM-v3", revision=revision,
+                                                           trust_remote_code=True)
+                    self.kind = f"GigaAM-v3 HF ({revision})"
+                except Exception as e2:
+                    self.note += f"HF-версия недоступна ({e2}); переключаюсь на Whisper"
+                    backend = "whisper"
+        if backend == "whisper":
+            import torch
+            from transformers import pipeline
+
+            self.pipe = pipeline("automatic-speech-recognition", model=WHISPER_MODEL,
+                                 device=0 if torch.cuda.is_available() else -1)
+            self.kind = f"Whisper ({WHISPER_MODEL})"
+
+    def transcribe(self, wav_bytes: bytes) -> dict:
+        data, duration = _trim_wav(wav_bytes, MAX_AUDIO_SECONDS)
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            t0 = time.perf_counter()
+            if self.kind.startswith("Whisper"):
+                text = self.pipe(path, generate_kwargs={"language": "russian", "task": "transcribe"})["text"]
+            else:
+                text = self.model.transcribe(path)
+                if not isinstance(text, str):
+                    text = getattr(text, "text", str(text))
+            ms = int((time.perf_counter() - t0) * 1000)
+        finally:
+            os.remove(path)  # звук не храним
+        return {"text": text.strip(), "ms": ms, "seconds": round(duration, 1),
+                "trimmed": duration > MAX_AUDIO_SECONDS}

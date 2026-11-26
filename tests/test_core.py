@@ -196,3 +196,109 @@ def test_tv_presets_give_known_conditions_and_picks(label):
     assert cond_labels(cond)  # у каждого условия есть подпись-чип
     res = recommend(CAT, cond, "stock_store1")
     assert res.picks or res.nearest  # частый запрос не должен давать пустой экран
+
+
+# ---------- Новые условия (после проверки 26.11.2026) ----------
+def test_negation_excludes_panel():
+    res = recommend(CAT, {"panel_not": "OLED"}, STORE)
+    assert res.picks and all(p.row.panel != "OLED" for p in res.picks)
+
+
+def test_price_range_filters_both_sides():
+    res = recommend(CAT, {"price_min": 50000, "price_max": 80000}, STORE)
+    assert res.picks and all(50000 <= p.row.price <= 80000 for p in res.picks)
+
+
+def test_width_prefers_largest_that_fits():
+    res = recommend(CAT, {"width_max_cm": 125}, STORE)
+    assert res.picks and all(p.row.width_cm <= 125 for p in res.picks)
+    assert res.picks[0].row.diagonal_in >= 50
+
+
+def test_sport_prefers_high_refresh():
+    res = recommend(CAT, {"use": "sport"}, STORE)
+    assert res.picks[0].row.refresh_hz >= 100
+
+
+def test_llm_cannot_flip_negation():
+    data = {"c": [{"k": "panel", "v": "OLED", "q": "OLED"}]}
+    rules_items = parse_rules("только не OLED")
+    acc, rej = validate_llm_items("только не OLED", data, rules_items)
+    assert not acc and rej[0]["reason"] == "во фразе отрицание"
+
+
+def test_llm_new_keys_accepted():
+    text = "55 или 65 дюймов, повесят на стену"
+    data = {"c": [{"k": "diag_min", "v": 55, "q": "55 или 65 дюймов"}, {"k": "diag_max", "v": 65, "q": "55 или 65 дюймов"},
+                  {"k": "wall_mount", "v": True, "q": "повесят на стену"}]}
+    acc, _ = validate_llm_items(text, data, parse_rules(text))
+    assert kv(acc) == {"diag_min": 55, "diag_max": 65, "wall_mount": True}
+
+
+def test_knowledge_addons_only_on_need():
+    from core import knowledge
+    assert knowledge.addons("tv", {}) == []
+    items = [a["item"] for a in knowledge.addons("tv", {"wall_mount": True, "use": "games"})]
+    assert any("Кронштейн" in i for i in items) and any("HDMI" in i for i in items)
+    assert any("Доставка" in a["item"] for a in knowledge.addons("tv", {"diag_min": 65, "diag_max": 75}))
+    assert not any("Доставка" in a["item"] for a in knowledge.addons("tv", {"diag_min": 55, "diag_max": 55}))
+
+
+def test_knowledge_tables_load_and_summary():
+    from core import knowledge
+    assert len(knowledge.objections("tv")) >= 5 and len(knowledge.terms("tv")) >= 5
+    s = knowledge.summary({"diag_min": 55, "diag_max": 65, "panel_not": "OLED"})
+    assert s.startswith("Правильно понимаю") and "не OLED" in s
+
+
+# ---------- Версия для показа: «Уточните у клиента», экран клиента, итоги ----------
+from core.report import summarize
+from core.rules import client_diff, client_facts, explain_pick, missing_questions
+
+
+def test_missing_questions_order_and_limit():
+    assert missing_questions({}) == ["distance", "budget"]
+    assert missing_questions({"diag_min": 55, "diag_max": 65}) == ["budget", "use"]
+    assert missing_questions({"width_max_cm": 120, "price_max": 50000}) == ["use", "room"]
+    # для игр комнату не спрашиваем; всё известно — вопросов нет
+    assert missing_questions({"diag_min": 65, "diag_max": 65, "price_max": 1, "use": "games"}) == []
+
+
+def test_client_view_has_no_internal_details():
+    cat = load_catalog()
+    rows = [cat.iloc[i] for i in (10, 20, 25)]
+    for r in rows:
+        facts = client_facts(r)
+        assert len(facts) == 4 and str(r.diagonal_in) in facts[0]
+        assert not any("шт." in f or "stock" in f for f in facts)
+        p = explain_pick(r, {"use": "games"}, "stock_store1")
+        assert p.where in ("store", "warehouse")
+    diff = client_diff(rows)
+    assert diff and any("дешевле" in d for d in diff)
+    assert client_diff(rows[:1]) == []
+
+
+def test_client_diff_names_only_true_differences():
+    cat = load_catalog()
+    r = cat.iloc[5]
+    assert client_diff([r, r.copy()]) == []  # одинаковые модели — отличий нет
+
+
+def test_report_counts_unmet_demand():
+    import json
+    import pandas as pd
+
+    rows = [
+        ("shown", {"use": "games"}, ""),
+        ("no_match", {"diag_min": 65, "diag_max": 65, "panel": "OLED", "price_max": 90000}, ""),
+        ("no_match", {"diag_min": 65, "diag_max": 65, "panel": "OLED", "price_max": 90000}, ""),
+        ("wrong", {}, "не та цена"),
+    ]
+    log = pd.DataFrame([{"outcome": o, "conditions": json.dumps(c, ensure_ascii=False), "reason": r or None,
+                         "terms_done": 4, "terms_total": 8} for o, c, r in rows])
+    rep = summarize(log)
+    assert rep["total"] == 4 and rep["shown_share"] == 25 and rep["no_match"] == 2
+    assert rep["unmet"][0][1] == 2 and "OLED" in rep["unmet"][0][0]
+    assert rep["wrong_reasons"] == [("не та цена", 1)]
+    assert rep["terms_avg"] == 4.0
+    assert summarize(log.iloc[0:0])["total"] == 0

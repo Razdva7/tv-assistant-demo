@@ -14,9 +14,12 @@ import streamlit as st
 
 from core import config
 from core.catalog import load_catalog
+from core import knowledge
 from core.categories import CATEGORIES
 from core.parser import KEY_LABEL, LLMParser, parse
-from core.rules import QUESTIONS, clear_cond, compare_table, cond_labels, count_matches, recommend, rub
+from core.report import summarize
+from core.rules import (QUESTIONS, clear_cond, client_diff, client_facts, compare_table, cond_labels,
+                        count_matches, explain_pick, missing_questions, recommend, rub)
 
 st.set_page_config(page_title="Помощник подбора", page_icon="🛒", layout="centered",
                    initial_sidebar_state="auto")
@@ -88,7 +91,25 @@ st.markdown(
           box-shadow: 0 -4px 14px rgba(22,32,46,.12);}
       .block-container {padding-bottom: 140px !important;}
     }
+    .say {background: #FFF4EC; border-left: 4px solid #E8642C; border-radius: .4rem; padding: .45rem .7rem;
+          margin: .2rem 0 .4rem; font-size: .95rem;}
+    .found {font-weight: 700; font-size: 1.05rem; margin: .3rem 0 .2rem;}
+    .addons {background: #E3EDF8; border-radius: .6rem; padding: .5rem .7rem; margin-bottom: .5rem;}
+    .addons-h {font-weight: 700; color: #1D4E89; margin-bottom: .2rem;}
+    .addon {margin: .15rem 0;} .ask {color: #5B6472; font-size: .88rem;}
     .heard {background: #ECEAE4; border-radius: .6rem; padding: .45rem .7rem; margin: .3rem 0 .5rem;}
+    .asks-h {font-weight: 700; margin: .6rem 0 .1rem;} .asks-s {color: #5B6472; font-size: .85rem; margin-bottom: .2rem;}
+    /* Экран «Показать клиенту»: крупно, без служебного */
+    .cv-h {font-size: 1.6rem; font-weight: 800; margin: .4rem 0 .1rem;}
+    .cv-need {color: #5B6472; font-size: 1rem; margin-bottom: .6rem;}
+    .cv-top {display: flex; justify-content: space-between; align-items: baseline; gap: .6rem;}
+    .cv-t {font-size: 1.3rem; font-weight: 800;} .cv-p {font-size: 1.5rem; font-weight: 800; white-space: nowrap;}
+    .cv-av {font-size: .95rem; color: #1D4E89; margin: .1rem 0 .4rem;}
+    .cv-why {font-size: 1.08rem; color: #16202E; margin: .2rem 0;} .cv-trade {font-size: 1rem; color: #8A3512; margin: .2rem 0;}
+    .cv-fact {font-size: .95rem; color: #4A5262; margin: .1rem 0;}
+    .cv-diff {background: #FFF4EC; border-left: 4px solid #E8642C; border-radius: .4rem; padding: .6rem .8rem;
+              font-size: 1.05rem; margin: .4rem 0;}
+    .rep {font-size: .92rem;} .rep b {color: #16202E;}
     </style>""",
     unsafe_allow_html=True,
 )
@@ -125,19 +146,32 @@ def get_asr():
 cat = get_catalog()
 ss = st.session_state
 for k, v in (("category", None), ("preview", None), ("store", next(iter(config.STORES))), ("cond", {}),
-             ("parse", None), ("asr", None), ("voice_error", None), ("ask_reason", False), ("voice_n", 0)):
+             ("parse", None), ("asr", None), ("voice_error", None), ("ask_reason", False), ("voice_n", 0),
+             ("client_skus", None), ("demo_phrase", None)):
     ss.setdefault(k, v)
 
-VALUE_LABEL = {"movies": "кино и сериалы", "games": "игры", "tv": "ТВ и YouTube",
-               "bright": "светлая", "dark": "тёмная"}
+VALUE_LABEL = {"movies": "кино и сериалы", "games": "игры", "sport": "спорт", "tv": "ТВ и YouTube",
+               "bright": "светлая", "dark": "тёмная", True: "да"}
+SHOW_FIRST = 3  # сразу видно 3 модели, остальные — по кнопке «Ещё»
 WIDGET_FOR = {"use": "q_use", "room": "q_room", "diag": "q_distance", "price_max": "q_budget"}
 OUTCOMES = {"shown": "✅ Показал клиенту", "no_match": "🚫 Нет подходящих", "wrong": "✏️ Подсказка неверная"}
 REASONS = ["не тот размер", "нет в наличии на самом деле", "не та цена", "не подходит по назначению", "другое"]
+# Сценарий показа: фразы, которые разбираются так же, как сказанные голосом (на случай шума в кабинете)
+DEMO_PHRASES = [
+    "шестьдесят пять дюймов, для плейстейшн, до ста тысяч",
+    "только не олед, 55 или 65 дюймов",
+    "от 50 до 80 тысяч, для сериалов",
+    "ниша 125 сантиметров, повесят на стену",
+    "для футбола, комната светлая",
+    "65 дюймов олед до девяноста тысяч",
+]
 
 
 def human(k, v) -> str:
-    if k == "price_max":
+    if k in ("price_max", "price_min"):
         return rub(v)
+    if k == "width_max_cm":
+        return f"{v} см"
     if k == "diag_exact":
         return f"{v}″"
     if k == "distance_m":
@@ -165,9 +199,13 @@ def clear_consultation():
     for k in list(ss.keys()):
         if k.startswith("q_"):
             ss[k] = None
-        elif k.startswith("cmp_"):
+        elif k.startswith(("cmp_", "term_")):
             ss[k] = False
+    ss.objection = None
     ss.typed = ""
+    ss.client_skus = None
+    ss.demo_phrase = None
+    ss.pop("kept", None)
 
 
 def on_pick_category(cid: str):
@@ -181,6 +219,31 @@ def on_pick_category(cid: str):
 
 def on_change_category():
     ss.category, ss.preview = None, None
+    ss.client_skus = None
+
+
+def on_demo(phrase: str):
+    """Фраза из сценария показа: новый клиент + разбор фразы, как будто её сказали голосом."""
+    ss.category, ss.preview = "tv", None
+    clear_consultation()
+    ss.demo_phrase = phrase
+    apply_text(phrase)
+
+
+KEEP_PREFIX = ("cmp_", "q_", "term_")  # отметки, которые должны пережить переход на экран клиента и обратно
+
+
+def on_client(skus: list):
+    # Streamlit забывает состояние кнопок, которые не нарисованы на экране, поэтому запоминаем их сами
+    ss.kept = {k: ss[k] for k in list(ss.keys()) if isinstance(k, str) and k.startswith(KEEP_PREFIX)}
+    ss.kept["objection"] = ss.get("objection")
+    ss.client_skus = skus
+
+
+def on_back():
+    ss.client_skus = None
+    for k, v in ss.pop("kept", {}).items():
+        ss[k] = v
 
 
 def on_question(qkey: str):
@@ -248,6 +311,7 @@ def on_voice():
         ss.voice_error = f"не удалось распознать: {e}"
         return
     ss.asr = out
+    ss.demo_phrase = None
     if out["text"]:
         apply_text(out["text"])
     else:
@@ -258,6 +322,7 @@ def on_typed():
     text = (ss.get("typed") or "").strip()
     if text:
         ss.asr = None
+        ss.demo_phrase = None
         apply_text(text)
 
 
@@ -267,15 +332,26 @@ def on_remove(key: str):
         ss[WIDGET_FOR[key]] = None
 
 
+LOG_HEADER = ["time", "category", "store", "conditions", "shown_skus", "outcome", "reason", "terms_done", "terms_total"]
+
+
 def log_event(outcome: str, reason: str, picks):
     config.LOG_PATH.parent.mkdir(exist_ok=True)
+    if config.LOG_PATH.exists():  # журнал старого формата откладываем в сторону, чтобы не смешивать колонки
+        with open(config.LOG_PATH, encoding="utf-8") as f:
+            if f.readline().strip().split(",") != LOG_HEADER:
+                f.close()
+                config.LOG_PATH.rename(config.LOG_PATH.with_name("events_old.csv"))
     new = not config.LOG_PATH.exists()
+    total = len(knowledge.terms(ss.category))
+    done = sum(1 for i in range(total) if ss.get(f"term_{i}"))
     with open(config.LOG_PATH, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["time", "category", "store", "conditions", "shown_skus", "outcome", "reason"])
+            w.writerow(LOG_HEADER)
         w.writerow([datetime.now().isoformat(timespec="seconds"), ss.category, ss.store,
-                    json.dumps(ss.cond, ensure_ascii=False), " ".join(p.row.sku for p in picks), outcome, reason])
+                    json.dumps(ss.cond, ensure_ascii=False), " ".join(p.row.sku for p in picks), outcome, reason,
+                    done, total])
 
 
 def on_outcome(code: str, picks):
@@ -350,6 +426,101 @@ def screen_categories():
                        "Для новой категории нужны только описание, каталог с остатками и правила подбора.")
 
 
+def input_controls(c, skip=()):
+    """Текст, частые запросы и вопросы. До запроса — на виду, после — свёрнуты в «Изменить запрос».
+    skip — вопросы, которые уже показаны в блоке «Уточните у клиента» (одинаковый ключ дважды Streamlit не даёт)."""
+    with st.form("typed_form", border=False):
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.text_input("Или текстом", key="typed", placeholder="65 дюймов для PS5 до 100 тысяч",
+                          label_visibility="collapsed")
+            st.form_submit_button("Разобрать", on_click=on_typed)
+    st.markdown("**Частые запросы**")
+    with st.container(horizontal=True, key="presets"):
+        for label in c.presets:
+            st.button(label, key=f"preset_{label}", on_click=on_preset, args=(label,))
+    st.markdown("**Уточнить вопросами**")
+    for qkey, q in QUESTIONS.items():
+        if qkey in skip:
+            continue
+        st.segmented_control(q["label"], list(q["options"]), key=f"q_{qkey}",
+                             on_change=on_question, args=(qkey,))
+
+
+def consultation_help(cid: str):
+    """Подсказки по стандарту консультации: только то, что относится к этому клиенту."""
+    adds = knowledge.addons(cid, ss.cond)
+    objs = knowledge.objections(cid)
+    terms = knowledge.terms(cid)
+    if not (adds or objs or terms):
+        return
+    st.markdown("#### Консультация")
+    if adds:
+        lines = "".join(f"<p class='addon'>＋ <b>{a['item']}</b> — {a['reason'][:1].lower() + a['reason'][1:]}. "
+                        f"<span class='ask'>Спросите: {a['ask']}</span></p>" for a in adds)
+        st.markdown(f"<div class='addons'><div class='addons-h'>Предложить по потребности</div>{lines}</div>",
+                    unsafe_allow_html=True)
+    if objs:
+        with st.expander(f"Ответ на возражение ({len(objs)})"):
+            q = st.selectbox("Что спросил клиент?", [o["question"] for o in objs], index=None,
+                             key="objection", placeholder="Выберите вопрос клиента", label_visibility="collapsed")
+            if q:
+                o = next(o for o in objs if o["question"] == q)
+                st.markdown(o["answer"])
+                if o.get("status"):
+                    st.caption(o["status"])
+    if terms:
+        done = sum(1 for i in range(len(terms)) if ss.get(f"term_{i}"))
+        with st.expander(f"Перед оформлением: не забыть сказать ({done} из {len(terms)})"):
+            st.caption("Отметки по желанию — это подсказка, а не контроль.")
+            for i, t in enumerate(terms):
+                st.checkbox(f"**{t['item']}** — {t['hint']}", key=f"term_{i}")
+
+
+def ask_block() -> list[str]:
+    """Этап «Потребности»: не больше двух вопросов, которых клиент ещё не касался. Ответ сразу меняет подборку."""
+    asks = [q for q in missing_questions(ss.cond, limit=4) if ss.get(f"q_{q}") is None][:2]
+    if asks:
+        st.markdown("<div class='asks-h'>Уточните у клиента</div>"
+                    "<div class='asks-s'>Ответ одним нажатием — подборка станет точнее</div>", unsafe_allow_html=True)
+        for q in asks:
+            st.segmented_control(QUESTIONS[q]["label"], list(QUESTIONS[q]["options"]), key=f"q_{q}",
+                                 on_change=on_question, args=(q,))
+    return asks
+
+
+def screen_client():
+    """Экран, который продавец разворачивает к покупателю: крупно, честно, без остатков и служебного текста."""
+    rows = [cat[cat.sku == s].iloc[0] for s in ss.client_skus if (cat.sku == s).any()]
+    st.button("← Вернуться к подбору", on_click=on_back, key="cv_back", width="stretch")
+    st.markdown("<div class='cv-h'>Подобрали для вас</div>", unsafe_allow_html=True)
+    need = knowledge.need_phrase(ss.cond)
+    if need:
+        st.markdown(f"<div class='cv-need'>Вы просили: {need}</div>", unsafe_allow_html=True)
+    diff = client_diff(rows)
+    if diff:
+        st.markdown("<div class='cv-diff'><b>Чем отличаются</b><br>" + "<br>".join(f"• {d}" for d in diff) + "</div>",
+                    unsafe_allow_html=True)
+    for r in rows:
+        p = explain_pick(r, ss.cond, ss.store)
+        avail = "Есть в этом магазине" if p.where == "store" else "Привезём со склада за 2–3 дня"
+        # Без повторов: размер и цена уже видны крупно, одна мысль про матрицу или частоту — один раз
+        seen, why_lines = set(), []
+        for w in p.why:
+            tok = w.split()[0]
+            if w.startswith(("Ширина", "В бюджете", f"{r.diagonal_in}″")) or tok in seen:
+                continue
+            seen.add(tok)
+            why_lines.append(w)
+        why = "".join(f"<p class='cv-why'>✓ {w}</p>" for w in why_lines)
+        trade = "".join(f"<p class='cv-trade'>• {t}</p>" for t in p.trade if not t.startswith("Ослаблено"))
+        facts = "".join(f"<p class='cv-fact'>{f}</p>" for f in client_facts(r) if f.split()[0] not in seen)
+        with st.container(border=True):
+            st.markdown(f"<div class='cv-top'><span class='cv-t'>{p.title}</span><span class='cv-p'>{rub(r.price)}</span>"
+                        f"</div><div class='cv-av'>{avail}</div>{why}{trade}{facts}", unsafe_allow_html=True)
+    st.caption("Цены и наличие — на момент показа. Точные характеристики — в карточке товара.")
+    st.button("← Вернуться к подбору", on_click=on_back, key="cv_back2", width="stretch")
+
+
 def screen_category(cid: str):
     c = CATEGORIES[cid]
     with st.container(horizontal=True, vertical_alignment="center", key="head"):
@@ -357,67 +528,64 @@ def screen_category(cid: str):
         st.button("↩ Категории", on_click=on_change_category, key="change_cat")
         st.button("＋ Новый клиент", on_click=clear_consultation, key="new_cons", type="primary")
 
-    # 1. Голос — главный способ ввода
+    # Голос — главный способ ввода (на телефоне кнопка закреплена внизу)
     with st.container(key="voicebar"):
         st.audio_input("Голосовая выжимка", key=f"voice_{ss.voice_n}", on_change=on_voice,
                        label_visibility="collapsed")
-    st.caption(f"🎙 Скажите 3–5 слов, говорит только продавец. Например: {c.voice_example} · "
-               "«солнечная комната, сериалы» · «диван в двух метрах, олед»")
     if ss.voice_error:
         st.warning(ss.voice_error)
     if ss.asr and ss.asr.get("text"):
         st.markdown(f"<div class='heard'>🎙 Услышал: «{ss.asr['text']}»</div>", unsafe_allow_html=True)
+    elif ss.demo_phrase:
+        st.markdown(f"<div class='heard'>🎬 Фраза из сценария: «{ss.demo_phrase}»</div>", unsafe_allow_html=True)
     if ss.parse and ss.parse.error:
         st.caption(f"Модель не ответила, разобрал правилами. ({ss.parse.error})")
-    with st.form("typed_form", border=False):
-        with st.container(horizontal=True, vertical_alignment="bottom"):
-            st.text_input("Или текстом", key="typed", placeholder="65 дюймов для PS5 до 100 тысяч",
-                          label_visibility="collapsed")
-            st.form_submit_button("Разобрать", on_click=on_typed)
 
-    # 2. Частые запросы — одно нажатие
-    st.markdown("**Частые запросы**")
-    with st.container(horizontal=True, key="presets"):
-        for label in c.presets:
-            st.button(label, key=f"preset_{label}", on_click=on_preset, args=(label,))
-
-    # 3. Уточнить вопросами
-    with st.expander("Уточнить вопросами", expanded=not ss.cond):
-        for qkey, q in QUESTIONS.items():
-            st.segmented_control(q["label"], list(q["options"]), key=f"q_{qkey}",
-                                 on_change=on_question, args=(qkey,))
-
-    labels = cond_labels(ss.cond)
-    if labels:
-        st.caption("Условия подбора — лишнее снимите нажатием")
-        with st.container(horizontal=True, key="chips"):
-            for key, label in labels:
-                st.button(f"{label} ✕", key=f"rm_{key}", on_click=on_remove, args=(key,))
-
-    # 4. Подборка
-    if not ss.cond:
+    if not ss.cond:  # до запроса: подсказка и все способы ввода на виду
+        st.caption(f"🎙 Скажите 3–5 слов, говорит только продавец. Например: {c.voice_example} · "
+                   "«солнечная комната, сериалы» · «только не олед, 55 или 65 дюймов»")
+        input_controls(c)
         st.info("Скажите выжимку, нажмите частый запрос или ответьте на вопрос — подборка появится сразу.")
         return
+
+    # После запроса: условия, резюме для клиента, подборка — без прокрутки
+    with st.container(horizontal=True, key="chips"):
+        for key, label in cond_labels(ss.cond):
+            st.button(f"{label} ✕", key=f"rm_{key}", on_click=on_remove, args=(key,))
+    say = knowledge.summary(ss.cond)
+    if say:
+        st.markdown(f"<div class='say'>🗣 {say}</div>", unsafe_allow_html=True)
+
     n = count_matches(cat, ss.cond, ss.store)
     res = recommend(cat, ss.cond, ss.store)
     picks = res.picks
-    st.markdown(f"#### Подходит {n} {plural(n)} в наличии")
     if picks:
-        for p in picks:
+        st.markdown(f"<div class='found'>Подходит {n} {plural(n)} в наличии</div>", unsafe_allow_html=True)
+        for p in picks[:SHOW_FIRST]:
+            card(p)
+        rest = picks[SHOW_FIRST:]
+        if rest:
+            with st.expander(f"Ещё {len(rest)} {plural(len(rest))}"):
+                for p in rest:
+                    card(p)
+        asks = ask_block()
+    elif res.nearest:
+        st.warning(f"В этом магазине нет моделей под все условия. Больше всего отсекает: **{res.blocker or '—'}**. "
+                   "Ближайшие варианты — компромисс назван в карточке:")
+        for p in res.nearest:
             card(p)
     else:
-        if res.nearest:
-            st.warning(f"В этом магазине нет моделей под все условия. Больше всего отсекает: **{res.blocker or '—'}**. "
-                       "Ближайшие варианты — компромисс назван в карточке:")
-            for p in res.nearest:
-                card(p)
-        else:
-            st.warning("Условия противоречат друг другу: даже если снять одно, подходящих моделей нет. "
-                       "Снимите лишнее в чипах выше — чаще всего это бюджет или тип матрицы.")
+        st.warning("Условия противоречат друг другу: даже если снять одно, подходящих моделей нет. "
+                   "Снимите лишнее в условиях выше — чаще всего это бюджет или тип матрицы.")
     if res.warehouse:
         with st.expander(f"Подходят, но только на складе ({len(res.warehouse)})"):
             for p in res.warehouse:
                 card(p, allow_compare=False)
+    if ss.cond.get("width_max_cm") and cat.attrs.get("width_estimated"):
+        st.caption("Ширина посчитана по диагонали — точную берите из карточки товара.")
+
+    if not picks:
+        asks = ask_block()
 
     shown = picks or res.nearest
     selected = [p.row for p in shown if ss.get(f"cmp_{p.row.sku}")]
@@ -428,8 +596,17 @@ def screen_category(cid: str):
         st.markdown(compare_html(compare_table(selected[:3], ss.store)), unsafe_allow_html=True)
         if len(selected) > 3:
             st.caption("Сравниваются первые три отмеченные модели.")
+    if shown:
+        to_client = [r.sku for r in selected[:3]] if len(selected) >= 2 else [p.row.sku for p in shown[:3]]
+        label = "📱 Показать клиенту сравнение" if len(selected) >= 2 else "📱 Показать клиенту эти модели"
+        st.button(label, on_click=on_client, args=(to_client,), key="to_client", width="stretch")
 
-    # 5. Итог консультации
+    consultation_help(cid)
+
+    with st.expander("✏️ Изменить запрос: текст, частые запросы, вопросы"):
+        input_controls(c, skip=asks)
+
+    # Итог консультации
     st.markdown("#### Итог консультации")
     with st.container(horizontal=True, key="outcomes"):
         for code, label in OUTCOMES.items():
@@ -440,6 +617,10 @@ def screen_category(cid: str):
 
 def sidebar(llm, llm_err, asr, asr_err):
     with st.sidebar:
+        with st.expander("🎬 Сценарий показа", expanded=True):
+            st.caption("Нажмите фразу — она разберётся так же, как сказанная голосом. Удобно, если в кабинете шумно.")
+            for i, ph in enumerate(DEMO_PHRASES):
+                st.button(f"«{ph}»", key=f"demo_{i}", on_click=on_demo, args=(ph,), width="stretch")
         st.subheader("Под капотом")
         st.caption("Модель только переводит слова продавца в условия. Подбирают правила по каталогу и остаткам — "
                    "модель не может придумать товар, цену или характеристику.")
@@ -479,13 +660,25 @@ def sidebar(llm, llm_err, asr, asr_err):
             st.caption(asr_err or asr.note)
         if llm_err:
             st.caption(llm_err)
-        st.subheader("Журнал итогов")
-        if config.LOG_PATH.exists():
-            log = pd.read_csv(config.LOG_PATH)
-            counts = log["outcome"].map(OUTCOMES).value_counts()
-            st.markdown("  \n".join(f"{k}: **{v}**" for k, v in counts.items()))
+        st.subheader("Итоги для руководителя")
+        rep = summarize(pd.read_csv(config.LOG_PATH)) if config.LOG_PATH.exists() else {"total": 0}
+        if rep["total"]:
+            lines = [f"Консультаций: <b>{rep['total']}</b> · показали клиенту <b>{rep['shown_share']}%</b>",
+                     f"Нет подходящих: <b>{rep['no_match']}</b> · подсказка неверна: <b>{rep['wrong']}</b>"]
+            if rep.get("terms_total"):
+                lines.append(f"«Не забыть сказать»: в среднем <b>{rep['terms_avg']}</b> из {rep['terms_total']}")
+            st.markdown("<div class='rep'>" + "<br>".join(lines) + "</div>", unsafe_allow_html=True)
+            if rep["unmet"]:
+                st.markdown("**Чего не хватило в магазине**")
+                st.markdown("<div class='rep'>" + "<br>".join(f"• {n} — <b>{k}</b>" for n, k in rep["unmet"])
+                            + "</div>", unsafe_allow_html=True)
+                st.caption("Запросы, на которые не нашлось модели: подсказка для закупки и выкладки.")
+            if rep["wrong_reasons"]:
+                st.markdown("**Почему подсказка неверна**")
+                st.markdown("<div class='rep'>" + "<br>".join(f"• {n} — <b>{k}</b>" for n, k in rep["wrong_reasons"])
+                            + "</div>", unsafe_allow_html=True)
         else:
-            st.caption("Пока пусто")
+            st.caption("Пока пусто: итог консультации записывается кнопками внизу экрана.")
         st.caption("Демо: каталог и бренды вымышленные, цены и остатки условные.")
 
 
@@ -494,6 +687,8 @@ asr, asr_err = get_asr()
 sidebar(llm, llm_err, asr, asr_err)
 if ss.category is None:
     screen_categories()
+elif ss.client_skus:
+    screen_client()
 else:
     st.caption(f"📍 {config.STORES[ss.store]}")
     screen_category(ss.category)

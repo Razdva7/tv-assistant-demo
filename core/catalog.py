@@ -1,24 +1,16 @@
-"""Заранее скачивает модели, чтобы первый показ не ждал загрузки. Запуск: python -m core.prefetch"""
-import time
+"""Вымышленный каталог телевизоров с остатками по магазинам. Только для демонстрации."""
+import pandas as pd
 
-from . import config
-
-
-def main():
-    t0 = time.time()
-    if config.PARSER == "llm":
-        from huggingface_hub import snapshot_download
-
-        print(f"Скачиваю языковую модель {config.LLM_MODEL} …", flush=True)
-        snapshot_download(config.LLM_MODEL)
-    if config.ASR_BACKEND != "none":
-        print("Проверяю распознавание речи …", flush=True)
-        from .asr import ASR
-
-        asr = ASR(config.ASR_BACKEND)
-        print(f"Распознавание: {asr.kind}. {asr.note}", flush=True)
-    print(f"Готово за {int(time.time() - t0)} с", flush=True)
+from .config import CATALOG_PATH
 
 
-if __name__ == "__main__":
-    main()
+def load_catalog(path=CATALOG_PATH) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    int_cols = ["diagonal_in", "refresh_hz", "hdmi21", "brightness_nits", "price",
+                "stock_store1", "stock_store2", "stock_store3", "stock_warehouse"]
+    df[int_cols] = df[int_cols].astype(int)
+    if "width_cm" not in df.columns:
+        # В демо-каталоге ширины нет: считаем по диагонали 16:9 (+3 см на рамку). На витринах берём из карточки.
+        df["width_cm"] = (df["diagonal_in"] * 2.54 * 0.8716 + 3).round().astype(int)
+        df.attrs["width_estimated"] = True
+    return df
