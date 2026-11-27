@@ -81,7 +81,7 @@ def build_reply(cat: pd.DataFrame, cond: dict, store: str, skip_asks=(), categor
                      "Уберите лишнее условие — чаще всего бюджет или тип матрицы.", reasons=[], alts=[],
                      diff=None, asks=asks, addons=addons, warehouse=res.warehouse, found=0, exact=False)
     main = picks[0]
-    head = f"покажите **{main.title} — {rub(main.row.price)}**, {_where(main)}"
+    head = f"покажите **{main.title}**, {_where(main)}"  # цена — только в карточке, не дублируем
     if exact:
         action = head[0].upper() + head[1:]
     else:

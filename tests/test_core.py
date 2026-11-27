@@ -312,7 +312,7 @@ from core.dialog import build_reply, merge_cond, summary_text
 def test_reply_one_window_is_short():
     r = build_reply(CAT, {"diag_min": 55, "diag_max": 65, "panel_not": "OLED"}, STORE)
     assert r.understood.startswith("телевизор — ") and "не OLED" in r.understood
-    assert r.action.startswith("Покажите **") and "₽" in r.action
+    assert r.action.startswith("Покажите **") and "₽" not in r.action  # цена только в карточке
     assert len(r.reasons) <= 3 and len(r.alts) <= 2 and len(r.asks) <= 2
     assert all("OLED" != p.row.panel for p in r.picks)
     assert r.asks == ["budget", "use"]
